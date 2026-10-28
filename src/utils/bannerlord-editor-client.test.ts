@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
 import { createServer, type Server, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
@@ -8,6 +8,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { loadEditorSession, requestEditor, editorStatus, editorToolResult } from './bannerlord-editor-client'
 import { registerBannerlordEditorTools } from '../tools/bannerlord-editor'
+import { configureTerrainLayers } from '../../tools/editor-probe/configure-layers'
+import { terrainBrushWithFloraRefresh } from './bannerlord-editor-flora'
 
 type Fixture = { root: string; sessionPath: string; gameDir: string; sceneDir: string; outputDir: string;
   token: string; server: Server; sockets: Set<Socket>; requests: any[]; config: Record<string, unknown> }
@@ -169,23 +171,136 @@ describe('editor session and transport boundaries', () => {
 })
 
 describe('public editor MCP schemas and registry', () => {
-  test('default only exposes status; full exposes six tools without lifecycle operations', async () => {
+  test('default only exposes status; full adds scoped scene and terrain authoring', async () => {
     expect((await (await mcp('query-first')).listTools()).tools.map(tool => tool.name)).toEqual(['bannerlord_editor_status'])
     const full = (await (await mcp('full')).listTools()).tools.map(tool => tool.name).sort()
     expect(full).toEqual(['bannerlord_editor_status', 'bannerlord_editor_entities', 'bannerlord_editor_prefab_info',
-      'bannerlord_editor_apply_layout', 'bannerlord_editor_save_scene', 'bannerlord_editor_capture'].sort())
+      'bannerlord_editor_apply_layout', 'bannerlord_editor_save_scene', 'bannerlord_editor_capture',
+      'bannerlord_editor_module_creation_info', 'bannerlord_editor_create_module', 'bannerlord_editor_save_scene_as',
+      'bannerlord_editor_terrain_info', 'bannerlord_editor_generate_terrain', 'bannerlord_editor_set_terrain_material',
+      'bannerlord_editor_terrain_flora_info', 'bannerlord_editor_configure_terrain_flora',
+      'bannerlord_editor_reset_terrain', 'bannerlord_editor_import_heightmap'].sort())
+  })
+
+  test('terrain parameters are bounded before the bridge receives a request', async () => {
+    const fixture = await makeFixture(), client = await mcp('full')
+    const valid = { nodesX: 2, nodesY: 2, nodeSize: 100, nodeDimension: 64 }
+    for (const parameters of [{ ...valid, nodesX: 0 }, { ...valid, nodeSize: 1.5 }, { ...valid, nodeDimension: 63 },
+      { ...valid, replace: true }, { nodesX: 16, nodesY: 16, nodeSize: 100, nodeDimension: 256 }]) {
+      expect((await client.callTool({ name: 'bannerlord_editor_generate_terrain', arguments: { sessionPath: fixture.sessionPath, parameters } })).isError).toBe(true)
+    }
+    expect(fixture.requests).toHaveLength(0)
+    const result = await client.callTool({ name: 'bannerlord_editor_generate_terrain', arguments: { sessionPath: fixture.sessionPath, parameters: valid } })
+    expect(result.isError).not.toBe(true)
+    expect(fixture.requests.map(r => r.action)).toEqual(['status', 'generate_terrain'])
+    expect(fixture.requests[1].args).toEqual({ ...valid, useDefaultScene: false })
+  })
+
+  test('official startup terrain requests never invent environment defaults or reload the placeholder', async () => {
+    const fixture = await makeFixture(), client = await mcp('full')
+    expect((await client.callTool({ name: 'bannerlord_editor_generate_terrain', arguments: {
+      sessionPath: fixture.sessionPath, parameters: { nodesX: 2, nodesY: 2 }, useDefaultScene: true,
+    } })).isError).not.toBe(true)
+    expect(fixture.requests.map(r => r.action)).toEqual(['generate_terrain'])
+    expect(fixture.requests[0].args).toEqual({ nodesX: 2, nodesY: 2, useDefaultScene: true })
+  })
+
+  test('heightmap bounds are validated before connecting and valid imports retain their scale', async () => {
+    const fixture = await makeFixture()
+    const client = await mcp('full')
+    for (const parameters of [{ heightScale: 0 }, { heightScale: 1001 }, { heightScale: 10, heightOffset: -1001 }]) {
+      const result = await client.callTool({ name: 'bannerlord_editor_import_heightmap', arguments: {
+        sessionPath: fixture.sessionPath, heightmapPath: join(fixture.outputDir, 'hills.png'), ...parameters,
+      } })
+      expect(result.isError).toBe(true)
+    }
+    expect(fixture.requests).toHaveLength(0)
+    const result = await client.callTool({ name: 'bannerlord_editor_import_heightmap', arguments: {
+      sessionPath: fixture.sessionPath, heightmapPath: join(fixture.outputDir, 'hills.png'), heightScale: 10,
+    } })
+    expect(result.isError).toBe(false)
+    expect(fixture.requests.map(request => request.action)).toEqual(['status', 'import_heightmap'])
+    expect(fixture.requests[1].args.heightScale).toBe(10)
+    expect(fixture.requests[1].args.heightOffset).toBe(0)
+  })
+
+  test('explicit user module sessions are accepted but official modules stay excluded', async () => {
+    const fixture = await makeFixture()
+    const sceneDir = join(fixture.gameDir, 'Modules/newmod/SceneObj/map_200')
+    await mkdir(sceneDir, { recursive: true })
+    await writeFile(fixture.sessionPath, JSON.stringify({ ...fixture.config, moduleName: 'newmod', sceneDir }))
+    expect((await loadEditorSession(fixture.sessionPath)).moduleDir).toBe(join(fixture.gameDir, 'Modules/newmod'))
+    const native = join(fixture.gameDir, 'Modules/Native/SceneObj/map_200')
+    await mkdir(native, { recursive: true })
+    await writeFile(fixture.sessionPath, JSON.stringify({ ...fixture.config, moduleName: 'Native', sceneDir: native }))
+    await expect(loadEditorSession(fixture.sessionPath)).rejects.toThrow()
+    expect(fixture.requests).toHaveLength(0)
   })
 
   test('invalid layout IDs, transforms, extra fields and overlong batches cannot reach the engine', async () => {
     const fixture = await makeFixture(), client = await mcp('full')
     const entity = { id: 'dock', prefab: 'wooden_platform_a', x: 0, y: 0, z: 1 }
-    const invalid = [ [{ ...entity, x: 101 }], [{ ...entity, sx: 0 }], [{ ...entity, rx: 3601 }],
+    const invalid = [ [{ ...entity, x: 201 }], [{ ...entity, sx: 0 }], [{ ...entity, rx: 3601 }],
       [{ ...entity, id: '../foreign' }], [{ ...entity, delete: true }], [entity, entity], Array.from({ length: 65 }, () => entity) ]
     for (const entities of invalid) {
       const reply = await client.callTool({ name: 'bannerlord_editor_apply_layout', arguments: { sessionPath: fixture.sessionPath, entities } })
       expect(reply.isError).toBe(true)
     }
     expect(fixture.requests).toHaveLength(0)
+  })
+
+  test('public flora editing sends a bounded native plan without a scene lifecycle action', async () => {
+    const fixture = await makeFixture(request => request.action === 'terrain_flora_plan'
+      ? { ok: true, result: { applied: true, live: true, requiresEditorReload: false } } : undefined)
+    const client = await mcp('full')
+    const parameters = { expectedRevision: 'A'.repeat(64), expectedLayers: ['Base Soil', 'Grassland'],
+      layers: [{ layer: 'Grassland', seasons: { summer: [{ name: 'flora_grass_a', density: 30 }] } }] }
+    const result = await client.callTool({ name: 'bannerlord_editor_configure_terrain_flora', arguments: { sessionPath: fixture.sessionPath, parameters } })
+    expect(result.isError).toBe(false)
+    expect(fixture.requests.map(x => x.action)).toEqual(['status', 'terrain_flora_plan'])
+    const path = fixture.requests[1].args.planPath
+    expect(path.startsWith(fixture.outputDir + sep)).toBe(true)
+    expect(JSON.parse(await readFile(path, 'utf8'))).toEqual(parameters)
+  })
+
+  test('legacy layer configuration uses live native memory and leaves saved XML untouched', async () => {
+    const fixture = await makeFixture((request, f) => {
+      if (request.action === 'status') return { ok: true, result: { editMode: true,
+        scene: 'bannersage_agent_harbor', probeScene: 'bannersage_agent_harbor',
+        resolvedSceneModule: join(f.gameDir, 'Modules/BannerlordSage.EditorProbe'), bridgeCapabilities: ['live_terrain_flora_v1'] } }
+      if (request.action === 'terrain_flora_info') return { ok: true, result: { revision: 'A'.repeat(64), layers: [{ name: 'Base Soil' }, { name: 'Grassland' }] } }
+      return { ok: true, result: { applied: true, live: true, requiresEditorReload: false } }
+    })
+    const layers = '<layers><layer name="Base Soil"><summer is_enabled="true"><meshes/></summer></layer><layer name="Grassland"><summer is_enabled="true"><meshes><mesh name="grass" density="10"/></meshes></summer></layer></layers>'
+    const xml = `<scene><terrain enabled="true">${layers}</terrain></scene>`
+    await writeFile(join(fixture.sceneDir, 'scene.xscene'), xml)
+    const native = join(fixture.gameDir, 'Modules/Native/ModuleData'); await mkdir(native, { recursive: true })
+    await writeFile(join(native, 'flora_kinds.xml'), '<flora_kinds><flora_kind name="grass"><flags><flag name="is_grass" value="true"/></flags></flora_kind></flora_kinds>')
+    const path = join(fixture.outputDir, 'layers.json')
+    await writeFile(path, JSON.stringify({ expectedLayers: ['Base Soil', 'Grassland'], layersXml: layers.replace('density="10"', 'density="30"') }))
+    const reply = await configureTerrainLayers(path, fixture.sessionPath)
+    expect(reply.ok).toBe(true)
+    expect(reply.result.requiresEditorReload).toBe(false)
+    expect(fixture.requests.map(x => x.action)).toEqual(['status', 'terrain_flora_info', 'terrain_flora_plan'])
+    expect(await readFile(join(fixture.sceneDir, 'scene.xscene'), 'utf8')).toBe(xml)
+  })
+
+  test('a flora refresh failure never retries an already applied brush', async () => {
+    const fixture = await makeFixture((request, f) => {
+      if (request.action === 'status') return { ok: true, result: { editMode: true,
+        scene: 'bannersage_agent_harbor', probeScene: 'bannersage_agent_harbor',
+        resolvedSceneModule: join(f.gameDir, 'Modules/BannerlordSage.EditorProbe'), bridgeCapabilities: ['live_terrain_flora_v1'] } }
+      if (request.action === 'terrain_flora_refresh') return { ok: false, error: 'refresh failed' }
+      return { ok: true, result: { painted: true } }
+    })
+    const result = await terrainBrushWithFloraRefresh('terrain_paint_plan', { planPath: join(fixture.outputDir, 'paint.json') }, fixture.sessionPath)
+    const first = result.content[0]
+    expect(first.type).toBe('text')
+    const reply = JSON.parse((first as { text: string }).text)
+    expect(result.isError).toBe(true)
+    expect(reply.brushApplied).toBe(true)
+    expect(reply.retryAutomatically).toBe(false)
+    expect(fixture.requests.map(x => x.action)).toEqual(['status', 'terrain_paint_plan', 'status', 'terrain_flora_refresh'])
   })
 
   test('public layout returns native partial state without automatically retrying', async () => {
@@ -197,6 +312,15 @@ describe('public editor MCP schemas and registry', () => {
     } })
     expect(result.isError).toBe(true)
     expect(textOf(result)).toContain('partial')
+    expect(fixture.requests.map(request => request.action)).toEqual(['status', 'apply_layout'])
+  })
+
+  test('layout reaches the far side of a 200 metre terrain', async () => {
+    const fixture = await makeFixture(), client = await mcp('full')
+    const result = await client.callTool({ name: 'bannerlord_editor_apply_layout', arguments: {
+      sessionPath: fixture.sessionPath, entities: [{ id: 'hill_rock', prefab: 'rock_new_a', x: 184, y: 199, z: 24 }],
+    } })
+    expect(result.isError).not.toBe(true)
     expect(fixture.requests.map(request => request.action)).toEqual(['status', 'apply_layout'])
   })
 })

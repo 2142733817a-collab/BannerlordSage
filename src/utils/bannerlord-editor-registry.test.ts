@@ -35,8 +35,8 @@ describe('editor integration into the real BannerlordSage server', () => {
       const expected = [...QUERY_FIRST_BANNERLORD_TOOL_NAMES, ...(mode === 'full' ? AUTHORING_BANNERLORD_TOOL_NAMES : [])].sort()
       expect(result.names).toEqual(expected)
       expect(new Set(result.names).size).toBe(result.names.length)
-      expect(result.names.length).toBe(mode === 'full' ? 43 : 36)
-      expect(result.names.filter((name: string) => name.startsWith('bannerlord_editor_')).length).toBe(mode === 'full' ? 6 : 1)
+      expect(result.names.length).toBe(mode === 'full' ? 53 : 36)
+      expect(result.names.filter((name: string) => name.startsWith('bannerlord_editor_')).length).toBe(mode === 'full' ? 16 : 1)
       expect(result.status.state).toBe('not_configured')
     })
   }

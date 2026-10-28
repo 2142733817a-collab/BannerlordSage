@@ -47,6 +47,16 @@ export const AUTHORING_BANNERLORD_TOOL_NAMES = [
   'bannerlord_editor_apply_layout',
   'bannerlord_editor_save_scene',
   'bannerlord_editor_capture',
+  'bannerlord_editor_module_creation_info',
+  'bannerlord_editor_create_module',
+  'bannerlord_editor_save_scene_as',
+  'bannerlord_editor_terrain_info',
+  'bannerlord_editor_terrain_flora_info',
+  'bannerlord_editor_configure_terrain_flora',
+  'bannerlord_editor_generate_terrain',
+  'bannerlord_editor_set_terrain_material',
+  'bannerlord_editor_reset_terrain',
+  'bannerlord_editor_import_heightmap',
 ] as const
 
 export function getBannerlordToolsetMode(): BannerlordToolsetMode {

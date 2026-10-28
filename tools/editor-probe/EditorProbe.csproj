@@ -11,6 +11,8 @@
     <Error Condition="'$(GameDir)' == ''" Text="Pass -p:GameDir with the real local Bannerlord installation." />
   </Target>
   <ItemGroup>
+    <Compile Remove="LiveTerrainLayers.cs" />
+    <Compile Remove="LiveTerrainSurfaces.cs" />
     <Reference Include="System.Drawing" />
     <Reference Include="TaleWorlds.MountAndBlade"><HintPath>$(GameDir)/bin/Win64_Shipping_wEditor/TaleWorlds.MountAndBlade.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="TaleWorlds.Engine"><HintPath>$(GameDir)/bin/Win64_Shipping_wEditor/TaleWorlds.Engine.dll</HintPath><Private>false</Private></Reference>
@@ -20,5 +22,6 @@
     <Reference Include="TaleWorlds.Localization"><HintPath>$(GameDir)/bin/Win64_Shipping_wEditor/TaleWorlds.Localization.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="TaleWorlds.ScreenSystem"><HintPath>$(GameDir)/bin/Win64_Shipping_wEditor/TaleWorlds.ScreenSystem.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Newtonsoft.Json"><HintPath>$(GameDir)/bin/Win64_Shipping_wEditor/Newtonsoft.Json.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="netstandard"><HintPath>$(GameDir)/bin/Win64_Shipping_wEditor/mono/lib/mono/4.7.2-api/Facades/netstandard.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
 </Project>

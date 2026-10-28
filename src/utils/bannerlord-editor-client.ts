@@ -2,8 +2,9 @@ import { connect } from 'node:net'
 import { open, realpath } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { z } from 'zod'
+import { prepareEditorPreview } from './bannerlord-editor-preview'
 
-export const EDITOR_PROBE_ACTIONS = ['status', 'enter_editor', 'open_scene', 'entities', 'place_probe', 'move_probe', 'save_scene', 'close_scene', 'quit', 'capture', 'apply_layout', 'layout_entities', 'focus', 'camera', 'prefab_info'] as const
+export const EDITOR_PROBE_ACTIONS = ['status', 'enter_editor', 'open_scene', 'entities', 'place_probe', 'move_probe', 'save_scene', 'close_scene', 'quit', 'capture', 'apply_layout', 'remove_layout', 'layout_entities', 'focus', 'camera', 'prefab_info', 'module_creation_info', 'create_module', 'bind_scene', 'terrain_info', 'terrain_samples', 'terrain_repair_bounds', 'terrain_add_layer', 'configure_terrain_layers', 'terrain_layer_stats', 'terrain_flora_info', 'terrain_flora_plan', 'terrain_flora_refresh', 'terrain_paint_plan', 'terrain_height_brush_plan', 'terrain_smooth_brush', 'generate_terrain', 'save_scene_as', 'import_heightmap'] as const
 export type EditorAction = typeof EDITOR_PROBE_ACTIONS[number]
 export const EDITOR_REQUEST_TIMEOUT_MS = 50000
 export const EDITOR_MAX_REPLY_BYTES = 1024 * 1024
@@ -47,6 +48,7 @@ export type EditorReply = {
 const sessionSchema = z.object({
   gameDir: z.string().min(1).max(4096), outputDir: z.string().min(1).max(4096), sceneDir: z.string().min(1).max(4096),
   token: z.string().min(8).max(256), port: z.number().int().min(1).max(65535),
+  moduleName: z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,63}$/).optional(),
 })
 
 async function readBoundedFile(path: string, maxBytes: number, code: EditorErrorCode): Promise<Buffer> {
@@ -89,7 +91,12 @@ export async function loadEditorSession(sessionPath?: string): Promise<EditorSes
   let gameDir: string, outputDir: string, sceneDir: string, moduleDir: string
   try {
     ;[gameDir, outputDir, sceneDir] = await Promise.all([realpath(config.gameDir), realpath(config.outputDir), realpath(config.sceneDir)])
-    moduleDir = await realpath(join(gameDir, 'Modules', 'BannerlordSage.EditorProbe'))
+    const moduleName = config.moduleName ?? 'BannerlordSage.EditorProbe'
+    if (/^(Native|SandBox|SandBoxCore|StoryMode|CustomBattle|Multiplayer|BirthAndDeath|FastMode|CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$/i.test(moduleName))
+      throw new Error('Official and device-name modules cannot be authoring targets')
+    const modulesRoot = await realpath(join(gameDir, 'Modules'))
+    moduleDir = await realpath(join(modulesRoot, moduleName))
+    if (!samePath(dirname(moduleDir), modulesRoot)) throw new Error('Module escaped game Modules')
     const expectedSceneRoot = join(moduleDir, 'SceneObj')
     const sceneRoot = await realpath(expectedSceneRoot)
     // Runtime aliases may resolve to the module; SceneObj must remain in it.
@@ -201,7 +208,7 @@ async function capturePng(session: EditorSession, reply: EditorReply) {
   } catch { throw new EditorClientError('invalid_capture') }
   const png = await readBoundedFile(path, EDITOR_MAX_CAPTURE_BYTES, 'invalid_capture')
   if (png.length < 24 || png.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') throw new EditorClientError('invalid_capture')
-  return png
+  return { png, path }
 }
 
 export async function editorToolResult(action: EditorAction, args: Record<string, unknown> = {}, sessionPath?: string, activeSceneRequired = false) {
@@ -209,7 +216,7 @@ export async function editorToolResult(action: EditorAction, args: Record<string
     const session = await loadEditorSession(sessionPath)
     if (activeSceneRequired) await requireActiveScene(session)
     const reply = await sendRequest(session, action, args)
-    if (action === 'apply_layout' && !reply.ok) {
+    if (['apply_layout', 'generate_terrain', 'bind_scene', 'save_scene_as', 'import_heightmap', 'terrain_flora_plan', 'terrain_flora_refresh'].includes(action) && !reply.ok) {
       reply.partialChangesPossible = true
       reply.retryAutomatically = false
     }
@@ -219,8 +226,12 @@ export async function editorToolResult(action: EditorAction, args: Record<string
       { type: 'text', text: JSON.stringify(reply) },
     ]
     if (action === 'capture' && reply.ok) {
-      const png = await capturePng(session, reply)
-      content.push({ type: 'image', data: png.toString('base64'), mimeType: 'image/png' })
+      const capture = await capturePng(session, reply)
+      const preview = await prepareEditorPreview(capture.path, capture.png)
+      reply.result.preview = { mimeType: preview.mimeType, bytes: preview.data.length,
+        originalBytes: capture.png.length, originalPngPreserved: true }
+      content[0] = { type: 'text', text: JSON.stringify(reply) }
+      content.push({ type: 'image', data: preview.data.toString('base64'), mimeType: preview.mimeType })
     }
     return { content, isError: !reply.ok }
   } catch (error) { return { content: [{ type: 'text' as const, text: JSON.stringify(errorReply(error)) }], isError: true } }

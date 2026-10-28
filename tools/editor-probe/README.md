@@ -22,8 +22,43 @@ Default mode includes `bannerlord_editor_status`; full mode adds:
 - `bannerlord_editor_apply_layout`: create/update up to 64 managed roots.
 - `bannerlord_editor_save_scene`: save the active dedicated scene.
 - `bannerlord_editor_capture`: return the current native PNG screenshot.
+- `bannerlord_editor_module_creation_info`: inspect native map Mod creation support and runtime/game module paths.
+- `bannerlord_editor_create_module`: create an asset/map Mod using the engine's `editor.create_new_module` command, which calls the same native creator as the Create New Module menu.
+- `bannerlord_editor_save_scene_as`: save the official startup scene or bound scene into a user module through the native Save As function.
+- `bannerlord_editor_terrain_info`: inspect terrain dimensions and resolution.
+- `bannerlord_editor_terrain_flora_info`: read the running editor's vegetation bindings, density, scale, seeds, color and revision for every season.
+- `bannerlord_editor_configure_terrain_flora`: add, remove or replace vegetation bindings and edit their parameters live, without closing the editor or reloading the scene. Native `save_scene` persists the result.
+- `bannerlord_editor_generate_terrain`: generate flat terrain; omitted node size/resolution inherit current native values.
+- `bannerlord_editor_set_terrain_material`: replace the material of an existing single-layer terrain with an official library template. It copies the complete template and updates plain seasonal references, preserving the rest of the scene XML. Refuses multiple layers or seasonal overrides.
 
-Public tools require the configured scene/module and do not open, replace,
+For whole-surface material changes, save the scene and quit normally through MCP,
+then call `bannerlord_editor_set_terrain_material`. The tool verifies that no game,
+editor or launcher process is running, backs up the XML in the configured output
+directory, and changes only the saved material definition. Restart the editor,
+open the bound scene through MCP, inspect its native terrain data and viewport,
+then save. Geometry and weightmap binaries are not edited. Do not use
+`MBTestRun.CloseScene` for this workflow: on the tested v1.4.8 editor it left edit
+mode and crashed while returning to the main menu. `MBTestRun.NewScene` has also
+crashed; obtain new scenes from the genuine official startup state instead.
+
+For a first map, ask whether the user already has a Mod workspace. If so, obtain
+its absolute folder path; otherwise ask for the new Mod folder name. Example
+names such as `newmod` are not defaults. Native map Mod creation is separate from
+the C# `create_mod_workspace` scaffold. It needs a running editor in edit mode,
+but no bound scene. It never opens, saves or replaces a scene. The module name
+must be 1–64 ASCII letters, digits or underscores, starting with a letter;
+Windows device names and existing target folders are rejected. The native
+creator writes the asset folders, `ModuleData/project.mbproj` and `SubModule.xml`.
+In an isolated runtime, the client verifies both module roots, moves the new
+folder into the real game's Modules directory, and links it back with an NTFS
+junction. No write is automatically retried; inspect partial output after a
+failure. Creation alone does not activate the Mod or bind the bridge to its scenes.
+
+Deploy the rebuilt bridge DLL before using the new tools; older running bridges
+are rejected by a capability check. Status also reports `canEnterEditor` so
+internal editor entry can wait for the initialized main menu.
+
+Scene tools require the configured scene/module and do not open, replace,
 reload or close scenes. Layout IDs are stable; updates keep GUIDs and reject
 prefab conflicts. Positions are finite and bounded, scales positive, and the
 whole batch is prevalidated. A runtime failure is not a transaction: inspect
@@ -129,7 +164,7 @@ version is checked independently of the indexed source dataset.
 
 The separate test surface `bun run tools/editor-probe/probe.ts mcp` exposes one
 generic `editor_probe` tool, including internal lifecycle actions. Prefer the
-six concrete tools above for normal agent use. Both routes share
+eight concrete tools above for normal agent use. Both routes share
 `src/utils/bannerlord-editor-client.ts`.
 
 ## Blueprint samples
@@ -168,22 +203,167 @@ in the user's local install or ignored dist folder.
 
 ## Validation and limitations
 
+### Terrain height range guard
+
+On the verified v1.4.8 native profile, the height texture writer converts
+normalized heights to 16-bit integers without clamping. Editable node bounds can
+exclude actual height samples after import or sculpting. Saving then wraps low
+samples into spikes and high samples into pits, even though the editable float
+heightmap remains smooth. A successful save or smooth collision samples alone
+cannot detect this failure.
+
+The probe expands editable node bounds to include every finite height sample,
+rounding outwards with a small margin for scene XML precision. It refreshes the
+native height textures when those bounds change and checks them before Save and
+Save As. While the configured scene is open, a periodic guard also covers manual
+editor saves. The guard preserves the height samples, validates the native binary
+and scene owner, and disables itself on an ABI or scene validation error.
+The private `terrain_repair_bounds` action reports the resulting encoding range.
+
+Regression validation must compare the decoded saved `terrain.bin` HGHT images
+against the editable float samples after repeated save/reopen cycles, as well as
+inspect native screenshots. Do not treat local smoothing as a persistent fix for
+this save-time overflow.
+
+### Private landscape authoring actions
+
+`terrain_add_layer` uses the native Add Layer backend with an official template
+and an English label. `configure_terrain_layers` routes vegetation-only changes
+to the live interface whenever the configured scene is open. Unsupported live
+material/label changes fail without closing or restarting the editor. Offline
+XML editing remains available only after verifying that the editor is stopped.
+Its bounded JSON plan lives under bridge output; the Grassland layer may
+bind official grass kinds and verified ground cover, including the shrubs,
+leaves and stones from the treeless Battanian forest preset; tree kinds remain
+rejected. Seed zero is supported to preserve official preset parameters.
+`terrain_paint_plan` applies
+bounded native material brush strokes from an output-directory JSON plan;
+`terrain_layer_stats` reads weight coverage and flora counts. Neither operation
+imports a new heightmap. Layout positions support the full 200 metre terrain;
+layout rotation inputs are degrees.
+
+### Live vegetation properties
+
+The private probe also supports scoped reference studies. `bind_scene` can
+switch from the currently bound authored scene with `saveCurrent:true`; it
+uses the native synchronous save followed by the normal editor OpenScene
+handler. The target must already be indexed and belong to a user module.
+`discardReference:true` is limited to `bannersage_reference_*` work copies with
+the `.bannersage-reference.json` marker, so it cannot discard an authored map.
+After a successful binding, update the local session identity from the returned
+directory and wait for the new scene status before editing. Do not automatically
+retry an accepted scene-open request that subsequently fails.
+
+For navigation inspection, the private `terrain_flora_info` diagnostic accepts
+`includeNavigation:true`, reporting actual face counts and face ID distributions.
+With `navigationVisible:true` it invokes only the verified editor navigation-mode
+action; false selects the normal selection mode. Verify the actual overlay:
+the toolbar QAction wrappers report unchecked even when navigation is visible.
+These in-process Qt calls do not send desktop input. The companion references
+TaleWorlds.DotNet as well as Engine and Library. A secondary Scene.Read preview
+attempt stalled this application-tick configuration and was removed; reference
+studies use normal editor opens of temporary copies instead.
+
+Build `EditorProbe.csproj` and `LiveTerrainLayers.csproj` against the same local
+`GameDir` and .NET Framework references. Deploy the main module normally and copy
+`BannerlordSage.EditorProbe.Live.dll` from the companion build into the session's
+`outputDir`. Installing the new main bridge requires one editor restart. The
+fixed local companion is loaded from bytes and can subsequently be rebuilt in
+place without restarting the editor. Requests cannot select an assembly path,
+class, method or executable.
+
+Read `bannerlord_editor_terrain_flora_info` first. Pass its `revision` as
+`expectedRevision`, its layer names in `expectedLayers`, and the desired complete
+flora lists for the selected layers/seasons to
+`bannerlord_editor_configure_terrain_flora`. An empty list removes that season's
+bindings. Other layers, heightmaps, material weights, prefabs and environment
+settings are retained. A changed revision, invalid kind, out-of-range value or
+duplicate row is rejected before mutation. Each applied plan produces a local
+metadata backup; native errors must not be retried automatically.
+
+The version-pinned implementation updates the active native material definitions
+and runtime flora records on the inspector's Qt thread. It runs both procedural
+generation and the renderer's final aggregation step, clearing old terrain draw
+entries to avoid duplication while retaining free flora. Main scene files are
+written only by the regular native save command. The private actions are
+`terrain_flora_info`, `terrain_flora_plan` and `terrain_flora_refresh`.
+The local v1.4.8 companion also repairs save-time square material-cache artifacts.
+`terrain_flora_info {includeSurfaceState:true}` hashes the editable height and
+weight buffers (at most sixteen nodes). `terrain_flora_refresh
+{surfaceRefresh:true}` prechecks an entirely zero material-brush footprint in every
+node and invokes the complete native brush/finalization path there, restoring UI
+settings and proving raw-buffer equality. It refuses when no safe footprint exists.
+The earlier direct texture/palette/delayed-refresh implementation failed visually
+after expanding from eight to thirteen layers; a forced height dispatcher also
+failed. Native history handling is delegated to the engine. The bound-scene save
+guard watches the three scene/terrain save files on the UI thread, waits for a
+one-second stable file signature, then performs that repair. The updated core
+installs it automatically; an older running core can enable the companion through
+`terrain_flora_refresh {surfaceSaveGuard:true}` without restarting. Inspect
+`terrain_flora_info {includeSurfaceSaveGuard:true}` for refresh count/errors.
+Three consecutive local thirteen-layer saves retained all 56 raw buffers and
+correct ground blending. This is a version-pinned compatibility repair, not a general
+engine serialization fix.
+
+The private material diagnostic `terrain_flora_info
+{includeSurfaceMaterials:true}` reads native blend/elevation/parallax/slope values.
+`terrain_flora_plan` also accepts a bounded `surface_palette_v1` plan containing
+`operation`, `expectedLayers` and `expectedFloraRevision`. Its fixed registered
+Native Captain 008 profile supports `inspect`, `register` and `create`, appending
+five reference templates/layers with no flora bindings. It uses the native XML
+descriptor reader and map insertion functions without reloading the library;
+template hash ownership persists across companion generations. `soften_existing`
+is a separate narrow update for the example scene's named soil/path parameters.
+All native ABI calls remain pinned to the examined v1.4.8 DLL fingerprint.
+The private MCP material, height-plan and smoothing actions also refresh flora
+after successful brush edits when this capability is installed. A refresh
+failure reports that the brush was already applied and forbids automatic retry.
+
+Each material stroke supports `hardness` (0..1), an optional official `pattern`
+filename from the editor's loaded brush browser, `angle` (0..360 degrees), and
+native modes 0 paint, 1 erase, 2 smooth weights, or 3 flatten to `target` (0..1).
+The full plan is checked before painting. Patterned strokes sample the native
+brush bitmap; they do not replace the terrain with a generated coverage image.
+Brush/UI settings are restored after each stroke, and upper layers remain
+available for overlap. The private `remove_layout` action takes 1..64 unique
+`ids`, checks every selected managed root before removing any, and refuses
+foreign or child entities. Save explicitly after landscape changes.
+
+`terrain_height_brush_plan` is a separate private native elevation action. Its
+bounded output-directory JSON contains explicit `x`, `y`, `radius`, `strength`
+and `mode` per stroke: 1 lowers elevation, 2 smooths it. Radius is 1..8 metres,
+strength 0.01..0.25, passes 1..4 and hardness 0..0.6. It rejects material-layer,
+pattern and flatten-target fields before applying any stroke, and repairs
+height encoding bounds after the batch. Calibrate and measure a small segment
+before applying a longer elevation plan; material-paint plans cannot edit height.
+
 The original local v1.4.8 validation covered prefab availability, idempotence,
 native save/reopen, GUID/full-transform persistence and real MCP images for the
 camp and harbor. This isolated public branch additionally checks the existing
-GitHub toolset plus six editor tools (default 36/full 43), shared transport/schema
+GitHub toolset plus twelve editor tools (default 36/full 49), shared transport/schema
 tests, C# build and release smoke. No unrelated local dataset/profile/features
 are included in this preview.
 
 ```powershell
 bun test src/utils/bannerlord-editor-client.test.ts
 bun test src/utils/bannerlord-editor-registry.test.ts
+bun test src/utils/bannerlord-editor-module.test.ts
+bun test src/utils/bannerlord-editor-terrain-material.test.ts
 bun run smoke:release
 ```
 
-- Validated: aligned v1.4.8, dedicated module scenes, existing prefabs and no
-  terrain. Native entity enumeration also includes invisible engine helpers.
-- **Not validated:** terrain authoring/save data, GI baking, headless rendering,
+- Validated: aligned v1.4.8, dedicated module scenes and existing prefabs.
+  Native entity enumeration also includes invisible engine helpers.
+- Also tested locally: a 200 by 200 metre flat terrain generated from the
+  official startup scene, native Save As into a user module, and replacing the
+  single base layer with the official `soil_b` template while stopped. Native
+  reload/capture/save confirmed the soil appearance and unchanged dimensions,
+  resolution and elevation. This does not validate general terrain painting.
+- Native map Mod creation has also been validated on v1.4.8 through the full
+  MCP server, including real game directory placement, an isolated runtime
+  junction, unchanged startup scene and duplicate-name rejection. This does
+  not validate loading the generated Mod into a campaign or binding a new scene.
+- **Not validated:** general terrain sculpting/painting, GI baking, headless rendering,
   playable Mission/player entry, navigation, deck collision traversal, sailing,
   custom TPAC/FBX ingestion, generic scene creation, undo and job cancellation.
   Ships in the sample are static props. The scope guard does not automatically

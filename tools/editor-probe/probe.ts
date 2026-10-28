@@ -5,6 +5,8 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
+import { configureTerrainLayers } from './configure-layers'
+import { terrainBrushWithFloraRefresh } from '../../src/utils/bannerlord-editor-flora'
 import { EDITOR_MAX_SESSION_BYTES, EDITOR_PROBE_ACTIONS, editorToolResult, requestEditor, type EditorAction, type EditorReply } from '../../src/utils/bannerlord-editor-client'
 
 const sessionPath = resolve(process.env.BANNERSAGE_EDITOR_PROBE_SESSION || resolve(import.meta.dir, '../../dist/editor-probe/session.json'))
@@ -73,13 +75,32 @@ async function serve() {
     description: 'Experimental local editor probe. Every write is restricted to the dedicated copied test scene.',
     inputSchema: {
       action: z.enum(actions),
-      args: z.object({ prefab: z.string().optional(), mesh: z.string().optional(), x: z.number().optional(), y: z.number().optional(), z: z.number().optional(),
+      args: z.object({ moduleName: z.string().optional(), sceneName: z.string().optional(), overwriteExisting: z.boolean().optional(), useDefaultScene: z.boolean().optional(),
+        ids: z.array(z.string().regex(/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/)).min(1).max(64).optional(),
+        nodesX: z.number().int().optional(), nodesY: z.number().int().optional(), nodeSize: z.number().int().optional(), nodeDimension: z.number().int().optional(),
+        layerTemplate: z.string().optional(), layerName: z.string().optional(), planPath: z.string().optional(), heightmapPath: z.string().optional(), heightScale: z.number().optional(), heightOffset: z.number().optional(),
+        radius: z.number().optional(), strength: z.number().optional(), passes: z.number().int().optional(),
+        saveCurrent: z.boolean().optional(), discardReference: z.boolean().optional(),
+        includeNavigation: z.boolean().optional(),
+        navigationVisible: z.boolean().optional(),
+        includeSurfaceState: z.boolean().optional(), surfaceRefresh: z.boolean().optional(),
+        includeSurfaceMaterials: z.boolean().optional(),
+        includeSurfaceSaveGuard: z.boolean().optional(), surfaceSaveGuard: z.boolean().optional(),
+        prefab: z.string().optional(), mesh: z.string().optional(), x: z.number().optional(), y: z.number().optional(), z: z.number().optional(),
         targetX: z.number().optional(), targetY: z.number().optional(), targetZ: z.number().optional(),
         entities: z.array(z.object({id:z.string(),prefab:z.string(),x:z.number(),y:z.number(),z:z.number(),
           rx:z.number().optional(),ry:z.number().optional(),rz:z.number().optional(),sx:z.number().optional(),sy:z.number().optional(),sz:z.number().optional()})).max(64).optional(),
       }).optional(),
     },
-  }, async ({ action, args }) => editorToolResult(action, args ?? {}, sessionPath))
+  }, async ({ action, args }) => {
+    if (action === 'configure_terrain_layers') {
+      const reply = await configureTerrainLayers(args?.planPath ?? '', sessionPath)
+      return { content: [{ type: 'text' as const, text: JSON.stringify(reply) }], isError: !reply.ok }
+    }
+    if (['terrain_paint_plan', 'terrain_height_brush_plan', 'terrain_smooth_brush'].includes(action))
+      return terrainBrushWithFloraRefresh(action, args ?? {}, sessionPath)
+    return editorToolResult(action, args ?? {}, sessionPath)
+  })
   await server.connect(new StdioServerTransport())
 }
 

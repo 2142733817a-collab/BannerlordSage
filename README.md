@@ -8,7 +8,7 @@
 
 An MCP server for **Mount & Blade II: Bannerlord** that provides source code search and data browsing.
 
-> **Editor MCP is an experimental test version — PRs welcome!** Local editor authoring is currently validated against an aligned Bannerlord game and Modding Kit **v1.4.8**. Prefab layout, scene saving and viewport capture have been tested; terrain editing, playable Missions, navigation and sailing are not yet validated. [Submit a PR](https://github.com/hby7921/BannerlordSage/pulls) or [report an issue](https://github.com/hby7921/BannerlordSage/issues).
+> **Editor MCP is an experimental test version — PRs welcome!** Local editor authoring is currently validated against an aligned Bannerlord game and Modding Kit **v1.4.8**. Prefab layout, scene saving, viewport capture, flat terrain generation and single-layer material replacement have been tested locally; general terrain painting, playable Missions, navigation and sailing remain unvalidated. [Submit a PR](https://github.com/hby7921/BannerlordSage/pulls) or [report an issue](https://github.com/hby7921/BannerlordSage/issues).
 
 It reads your local Bannerlord installation, imports XML, decompiles official DLLs, builds a SQLite index, and exposes MCP tools for AI coding agents. Use cases:
 
@@ -33,12 +33,12 @@ The project remains under the MIT License. See [`LICENSE`](./LICENSE).
 
 ## Tool Overview
 
-BannerlordSage provides **43 tools** across two entrypoints:
+BannerlordSage provides **49 tools** across two entrypoints:
 
 | Entrypoint | Tools | Notes |
 |------------|-------|-------|
 | `bun run start:bannerlord` | 36 | Query, analysis, mod-source work, project memory and experimental editor status |
-| `bun run start:bannerlord:full` | 43 | Adds workspace creation, XSLT patch generation and experimental editor authoring |
+| `bun run start:bannerlord:full` | 53 | Adds workspace creation, XSLT patch generation and experimental editor authoring |
 
 Basic workflow: **run setup → start MCP → let the model call tools**
 
@@ -60,9 +60,19 @@ Basic workflow: **run setup → start MCP → let the model call tools**
 | `bannerlord_editor_prefab_info` ⁺ | Check a prefab and optional mesh bounds in the running editor |
 | `bannerlord_editor_apply_layout` ⁺ | Create or update up to 64 managed prefab roots with stable IDs |
 | `bannerlord_editor_save_scene` ⁺ | Save the active dedicated scene through the native editor |
-| `bannerlord_editor_capture` ⁺ | Return the current native viewport as a PNG image through MCP |
+| `bannerlord_editor_capture` ⁺ | Return a PNG/JPEG preview capped at 192 KiB; preserve the full-resolution PNG on disk |
+| `bannerlord_editor_module_creation_info` ⁺ | Check native map Mod creation support and runtime/game module paths |
+| `bannerlord_editor_create_module` ⁺ | Create a native asset/map Mod in the game Modules directory without opening a scene |
+| `bannerlord_editor_save_scene_as` ⁺ | Save the official startup scene or bound scene into a user module through native Save As |
+| `bannerlord_editor_terrain_info` ⁺ | Read terrain dimensions and resolution |
+| `bannerlord_editor_terrain_flora_info` ⁺ | Read live vegetation bindings and parameters for every layer and season |
+| `bannerlord_editor_configure_terrain_flora` ⁺ | Change vegetation density, kinds, scale and color in the running editor; no restart or scene reload |
+| `bannerlord_editor_generate_terrain` ⁺ | Generate flat terrain using current official defaults for unspecified parameters |
+| `bannerlord_editor_import_heightmap` ⁺ | Import a bounded 16-bit PNG heightmap through the native terrain backend |
+| `bannerlord_editor_reset_terrain` ⁺ | Remove saved terrain with a backup while the editor is stopped |
+| `bannerlord_editor_set_terrain_material` ⁺ | Apply an official material to a saved single-layer terrain while the editor is stopped; back up XML first |
 
-Status is available in both entrypoints; the other five tools require full mode.
+Status is available in both entrypoints; the other editor authoring tools require full mode.
 Install the local C# bridge and open its dedicated scene first, then pass an
 optional absolute local `sessionPath` or set `BANNERSAGE_EDITOR_PROBE_SESSION` in
 the MCP service environment. The session JSON contains a local credential and

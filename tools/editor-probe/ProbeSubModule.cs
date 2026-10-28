@@ -33,6 +33,10 @@ namespace BannerlordSage.EditorProbe
         private int _mainThread;
         private int _loadThread;
         private long _ticks;
+        private float _heightBoundsGuardDelay;
+        private bool _heightBoundsGuardFailed;
+        private float _surfaceSaveGuardDelay;
+        private bool _surfaceSaveGuardFailed;
         private const string LayoutTagPrefix = "bannersage_layout_";
 
         private sealed class Pending
@@ -57,6 +61,25 @@ namespace BannerlordSage.EditorProbe
             _sceneDirectory = Environment.GetEnvironmentVariable("BANNERSAGE_EDITOR_PROBE_SCENE_DIR");
             ProbeSceneName = Environment.GetEnvironmentVariable("BANNERSAGE_EDITOR_PROBE_SCENE_NAME") ?? ProbeSceneName;
             string output = Environment.GetEnvironmentVariable("BANNERSAGE_EDITOR_PROBE_OUTPUT");
+            // Explicit local opt-in lets the normal Modding Kit launcher use the same
+            // connection as the supplied script, without persisting a token in user env.
+            if (string.IsNullOrWhiteSpace(_token) && string.IsNullOrWhiteSpace(_sceneDirectory) && string.IsNullOrWhiteSpace(output))
+            {
+                string pointer = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(typeof(ProbeSubModule).Assembly.Location), "..", "..", "bridge-session.path"));
+                if (File.Exists(pointer))
+                {
+                    if (new FileInfo(pointer).Length > 8192) throw new InvalidOperationException("Invalid bridge session pointer.");
+                    string configPath = File.ReadAllText(pointer).Trim();
+                    if (!Path.IsPathRooted(configPath) || new FileInfo(configPath).Length > 16384)
+                        throw new InvalidOperationException("Invalid local bridge session.");
+                    JObject config = JObject.Parse(File.ReadAllText(configPath));
+                    _token = config.Value<string>("token");
+                    _sceneDirectory = config.Value<string>("sceneDir");
+                    output = config.Value<string>("outputDir");
+                    ProbeSceneName = Path.GetFileName((_sceneDirectory ?? "").TrimEnd('\\', '/'));
+                    _configuredPort = config.Value<int?>("port") ?? 17748;
+                }
+            }
             if (string.IsNullOrWhiteSpace(_token) || string.IsNullOrWhiteSpace(_sceneDirectory) || string.IsNullOrWhiteSpace(output))
                 return; // Normal launches never start this experimental listener.
             if (!Regex.IsMatch(ProbeSceneName, "^[a-zA-Z][a-zA-Z0-9_]{0,79}$") ||
@@ -65,7 +88,7 @@ namespace BannerlordSage.EditorProbe
             Directory.CreateDirectory(output);
             _outputDirectory = Path.GetFullPath(output);
             _logPath = Path.Combine(output, "bridge.log");
-            int port = int.Parse(Environment.GetEnvironmentVariable("BANNERSAGE_EDITOR_PROBE_PORT") ?? "17748");
+            int port = int.Parse(Environment.GetEnvironmentVariable("BANNERSAGE_EDITOR_PROBE_PORT") ?? _configuredPort.ToString());
             try
             {
                 _listener = new TcpListener(IPAddress.Loopback, port);
@@ -90,6 +113,24 @@ namespace BannerlordSage.EditorProbe
             base.OnApplicationTick(dt);
             Interlocked.CompareExchange(ref _mainThread, Thread.CurrentThread.ManagedThreadId, 0);
             Interlocked.Increment(ref _ticks);
+            _surfaceSaveGuardDelay -= dt;
+            if (!_surfaceSaveGuardFailed && _running && _surfaceSaveGuardDelay <= 0 && MBEditor.IsEditModeOn &&
+                MBEditor._editorScene != null && MBEditor._editorScene.GetName() == ProbeSceneName && MBEditor._editorScene.ContainsTerrain)
+            {
+                _surfaceSaveGuardDelay = 1;
+                try { LiveLayerBridge.Execute("terrain_flora_refresh", RequireProbeScene(), new JObject { ["surfaceSaveGuard"] = true }, _outputDirectory); }
+                catch (Exception error) { _surfaceSaveGuardFailed = true; Log("Surface save guard disabled: " + error.Message); }
+            }
+            // Also protect manual editor saves after brush edits, in the bound scene
+            // only. Native ABI failures disable this guard rather than retry writes.
+            _heightBoundsGuardDelay -= dt;
+            if (!_heightBoundsGuardFailed && _running && _heightBoundsGuardDelay <= 0 && MBEditor.IsEditModeOn &&
+                MBEditor._editorScene != null && MBEditor._editorScene.GetName() == ProbeSceneName)
+            {
+                _heightBoundsGuardDelay = 0.1f;
+                try { NativeTerrain.RepairHeightBounds(RequireProbeScene()); }
+                catch (Exception error) { _heightBoundsGuardFailed = true; Log("Height bounds guard disabled: " + error.Message); }
+            }
             Pending pending;
             if (!_pending.TryDequeue(out pending) || Interlocked.CompareExchange(ref pending.State, 1, 0) != 0) return;
             try
@@ -192,12 +233,17 @@ namespace BannerlordSage.EditorProbe
         private object Execute(string action, JObject args)
         {
             if (action == "status") return Status();
+            if (action == "module_creation_info") return ModuleCreationInfo();
+            if (action == "create_module") return CreateNativeModule(args);
+            if (action == "bind_scene") return BindScene(args);
+            if (action == "save_scene_as") return SaveSceneAs(args);
             if (action == "enter_editor")
             {
                 if (!Utilities.EditModeEnabled) throw new InvalidOperationException("This process has no editor support.");
                 if (!MBEditor.IsEditModeOn)
                 {
                     AssertNoForeignScene();
+                    if (!(TaleWorlds.ScreenSystem.ScreenManager.TopScreen is MBInitialScreenBase)) throw new InvalidOperationException("Editor entry requires the initialized main menu.");
                     MBInitialScreenBase.OnEditModeEnterPress();
                 }
                 return new { requested = true };
@@ -211,8 +257,7 @@ namespace BannerlordSage.EditorProbe
             }
             if (action == "close_scene")
             {
-                RequireProbeScene();
-                return Accepted(MBTestRun.CloseScene(), "CloseScene");
+                throw new InvalidOperationException("CloseScene is disabled because it crashed this editor version. Save and quit normally instead.");
             }
             if (action == "quit")
             {
@@ -220,13 +265,55 @@ namespace BannerlordSage.EditorProbe
                 Utilities.QuitGame();
                 return new { requested = true };
             }
-            Scene scene = RequireProbeScene();
+            bool defaultScene = args.Value<bool?>("useDefaultScene") == true && (action == "terrain_info" || action == "generate_terrain");
+            Scene scene = defaultScene ? RequireOfficialDefaultScene() : RequireProbeScene();
+            if (action == "terrain_info") return NativeTerrain.Read(scene);
+            if (action == "terrain_samples") return NativeTerrain.ReadEditableSamples(scene);
+            if (action == "terrain_repair_bounds") return NativeTerrain.RepairHeightBounds(scene);
+            if (action == "terrain_add_layer") return NativeTerrain.AddLayer(scene, args.Value<string>("layerTemplate"), args.Value<string>("layerName"));
+            if (action == "terrain_paint_plan") return NativeTerrain.PaintPlan(scene, args.Value<string>("planPath"), _outputDirectory);
+            if (action == "terrain_height_brush_plan") return NativeTerrain.HeightBrushPlan(scene, args.Value<string>("planPath"), _outputDirectory);
+            if (action == "terrain_layer_stats") return NativeTerrain.LayerStats(scene);
+            if (action == "terrain_flora_info" || action == "terrain_flora_plan" || action == "terrain_flora_refresh")
+                return LiveLayerBridge.Execute(action, scene, args, _outputDirectory);
+            if (action == "terrain_smooth_brush") return NativeTerrain.SmoothBrush(scene, args.Value<float>("x"), args.Value<float>("y"),
+                args.Value<float?>("radius") ?? 8, args.Value<float?>("strength") ?? 0.2f, args.Value<int?>("passes") ?? 1);
+            if (action == "import_heightmap")
+                return NativeHeightmap.Import(scene, args.Value<string>("heightmapPath"), args.Value<double>("heightScale"), args.Value<double?>("heightOffset") ?? 0, _outputDirectory);
+            if (action == "generate_terrain")
+            {
+                string[] keys = { "nodesX", "nodesY", "nodeSize", "nodeDimension", "useDefaultScene", "layerTemplate" };
+                if (args.Properties().Any(p => !keys.Contains(p.Name)) ||
+                    new [] { "nodesX", "nodesY" }.Any(k => args[k] == null || args[k].Type != JTokenType.Integer) ||
+                    new [] { "nodeSize", "nodeDimension" }.Any(k => args[k] != null && args[k].Type != JTokenType.Integer))
+                    throw new InvalidOperationException("Terrain requires integer node X/Y counts and optional size/resolution overrides.");
+                return NativeTerrain.Generate(scene, args.Value<int>("nodesX"), args.Value<int>("nodesY"), args.Value<int?>("nodeSize"), args.Value<int?>("nodeDimension"), Log, args.Value<string>("layerTemplate") ?? "default");
+            }
             if (action == "layout_entities")
             {
                 var managed = GetEntities(scene).Where(x => x.Tags.Any(t => t.StartsWith(LayoutTagPrefix, StringComparison.Ordinal))).ToList();
                 return new { count = managed.Count, entities = managed.Select(LayoutEntityInfo).ToArray() };
             }
             if (action == "apply_layout") return ApplyLayout(scene, args);
+            if (action == "remove_layout")
+            {
+                var ids = args["ids"] as JArray;
+                if (ids == null || ids.Count < 1 || ids.Count > 64) throw new InvalidOperationException("Removal requires 1..64 managed layout IDs.");
+                var names = ids.Select(x => x.Value<string>()).ToArray();
+                if (names.Any(x => x == null || !Regex.IsMatch(x, "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")) || names.Distinct().Count() != names.Length)
+                    throw new InvalidOperationException("Invalid or duplicate removal ID.");
+                var selected = new List<GameEntity>();
+                var entities = GetEntities(scene);
+                foreach (string id in names)
+                {
+                    var matches = entities.Where(x => x.Name == LayoutTagPrefix + id && x.HasTag(LayoutTagPrefix + id)).ToList();
+                    if (matches.Count != 1 || matches[0].Parent != null) throw new InvalidOperationException("Managed root removal ID is missing or ambiguous: " + id);
+                    selected.Add(matches[0]);
+                }
+                foreach (GameEntity entity in selected) entity.Remove(0);
+                MBEditor.UpdateSceneTree(true);
+                return new { removed = selected.Count, ids = names };
+            }
             if (action == "prefab_info")
             {
                 string prefab = args.Value<string>("prefab");
@@ -299,6 +386,7 @@ namespace BannerlordSage.EditorProbe
             if (action == "save_scene")
             {
                 AssertScenePath();
+                NativeTerrain.RepairHeightBounds(scene);
                 return Accepted(MBTestRun.SaveScene(), "SaveScene");
             }
             throw new InvalidOperationException("Unsupported action: " + action);
@@ -308,6 +396,107 @@ namespace BannerlordSage.EditorProbe
         {
             if (!accepted) throw new InvalidOperationException(operation + " returned false.");
             return new { accepted = true };
+        }
+
+        private int _configuredPort = 17748;
+
+        private Scene RequireOfficialDefaultScene()
+        {
+            Scene scene = MBEditor._editorScene;
+            if (!MBEditor.IsEditModeOn || scene == null || scene.GetName() != "__default_new_editor_scene_" ||
+                scene.GetModulePath().Replace('\\', '/').TrimEnd('/') != "$BASE/Modules/Native")
+                throw new InvalidOperationException("This operation explicitly requires the official unsaved default scene.");
+            return scene;
+        }
+
+        private object SaveSceneAs(JObject args)
+        {
+            Scene scene = MBEditor._editorScene;
+            if (scene != null && scene.GetName() == "__default_new_editor_scene_") RequireOfficialDefaultScene();
+            else RequireProbeScene();
+            string module = args.Value<string>("moduleName"), name = args.Value<string>("sceneName");
+            if (args.Properties().Any(p => p.Name != "moduleName" && p.Name != "sceneName" && p.Name != "overwriteExisting") ||
+                !Regex.IsMatch(module ?? "", "^[A-Za-z][A-Za-z0-9_]{0,63}$") || !Regex.IsMatch(name ?? "", "^[A-Za-z][A-Za-z0-9_]{0,79}$") ||
+                Regex.IsMatch(module, "^(Native|SandBox|SandBoxCore|StoryMode|CustomBattle|Multiplayer|BirthAndDeath|FastMode|CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$", RegexOptions.IgnoreCase) ||
+                Regex.IsMatch(name, "^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$", RegexOptions.IgnoreCase))
+                throw new InvalidOperationException("Invalid authoring module or scene name.");
+            string modulePath = Path.GetFullPath(Path.Combine("../../Modules", module));
+            if (!File.Exists(Path.Combine(modulePath, "SubModule.xml"))) throw new InvalidOperationException("The authoring module is missing.");
+            string target = Path.Combine(modulePath, "SceneObj", name), backup = null;
+            if (File.Exists(target)) throw new InvalidOperationException("The scene destination is a file.");
+            if (Directory.Exists(target))
+            {
+                if (args.Value<bool?>("overwriteExisting") != true) throw new InvalidOperationException("Scene already exists; explicit overwriteExisting is required.");
+                if ((File.GetAttributes(target) & FileAttributes.ReparsePoint) != 0) throw new InvalidOperationException("Scene folder cannot be a link.");
+                backup = Path.Combine(_outputDirectory, "scene-backup-" + name + "-" + Guid.NewGuid().ToString("N"));
+                Directory.Move(target, backup);
+            }
+            try
+            {
+                NativeTerrain.RepairHeightBounds(scene);
+                NativeSceneSave.Save(name, "$BASE/Modules/" + module);
+                if (!File.Exists(Path.Combine(target, "scene.xscene")) || scene.GetName() != name ||
+                    !string.Equals(ResolveNativePath(scene.GetModulePath()).TrimEnd('\\', '/'), modulePath, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("Native Save As did not produce the requested scene identity and file.");
+                ProbeSceneName = name;
+                _sceneDirectory = target;
+                return new { saved = true, moduleName = module, sceneName = name, sceneDirectory = target, backupDirectory = backup,
+                    containsTerrain = scene.ContainsTerrain, terrain = NativeTerrain.Read(scene) };
+            }
+            catch (Exception error)
+            {
+                throw new InvalidOperationException(error.Message + "; inspect the destination before retrying. Previous scene backup: " + (backup ?? "none"));
+            }
+        }
+
+        private object BindScene(JObject args)
+        {
+            if (!MBEditor.IsEditModeOn) throw new InvalidOperationException("Enter the editor before binding a scene.");
+            Scene active = MBEditor._editorScene;
+            bool switching = active != null && active.GetName() != "__default_new_editor_scene_";
+            bool discardReference = args.Value<bool?>("discardReference") == true;
+            if (switching)
+            {
+                RequireProbeScene();
+                if (discardReference && (!active.GetName().StartsWith("bannersage_reference_", StringComparison.Ordinal) ||
+                    !File.Exists(Path.Combine(_sceneDirectory, ".bannersage-reference.json"))))
+                    throw new InvalidOperationException("Only a marked temporary reference copy may be discarded.");
+                if (!discardReference && args.Value<bool?>("saveCurrent") != true)
+                    throw new InvalidOperationException("Switching an authored scene requires explicit saveCurrent=true.");
+            }
+            string module = args.Value<string>("moduleName"), name = args.Value<string>("sceneName");
+            if (args.Properties().Any(p => p.Name != "moduleName" && p.Name != "sceneName" && p.Name != "saveCurrent" && p.Name != "discardReference") ||
+                (args["saveCurrent"] != null && args["saveCurrent"].Type != JTokenType.Boolean) ||
+                (args["discardReference"] != null && args["discardReference"].Type != JTokenType.Boolean) ||
+                !Regex.IsMatch(module ?? "", "^[A-Za-z][A-Za-z0-9_]{0,63}$") ||
+                !Regex.IsMatch(name ?? "", "^[A-Za-z][A-Za-z0-9_]{0,79}$") ||
+                Regex.IsMatch(module, "^(Native|SandBox|SandBoxCore|StoryMode|CustomBattle|Multiplayer|BirthAndDeath|FastMode|CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$", RegexOptions.IgnoreCase))
+                throw new InvalidOperationException("Invalid authoring module or scene name.");
+            string root = Path.GetFullPath(Path.Combine("../../Modules", module));
+            string scenePath = Path.Combine(root, "SceneObj", name);
+            if (!File.Exists(Path.Combine(root, "SubModule.xml")) || !File.Exists(Path.Combine(scenePath, "scene.xscene")))
+                throw new InvalidOperationException("The selected local module scene is missing.");
+            string previousPath = _sceneDirectory, previousName = ProbeSceneName;
+            try
+            {
+                if (switching && !discardReference)
+                {
+                    NativeTerrain.RepairHeightBounds(active);
+                    NativeSceneSave.Save(ProbeSceneName, active.GetModulePath().TrimEnd('/', '\\'));
+                }
+                _sceneDirectory = scenePath;
+                ProbeSceneName = name;
+                string registeredPath;
+                bool registered = Utilities.TryGetFullFilePathOfScene(name, out registeredPath);
+                if (registered) AssertScenePath();
+                if (switching)
+                {
+                    if (!registered) throw new InvalidOperationException("The target scene is not indexed by the running editor.");
+                    Accepted(MBTestRun.OpenScene(name), "OpenScene");
+                }
+                return new { bound = true, registered, opening = switching, moduleName = module, sceneName = name, sceneDirectory = scenePath };
+            }
+            catch { _sceneDirectory = previousPath; ProbeSceneName = previousName; throw; }
         }
 
         private void AssertNoForeignScene(bool allowEmptyDefault = false)
@@ -323,12 +512,46 @@ namespace BannerlordSage.EditorProbe
             if (scene != null) RequireProbeScene();
         }
 
+        private object ModuleCreationInfo()
+        {
+            return new {
+                capability = "native_module_create_v1",
+                command = "editor.create_new_module",
+                nativeModulesRoot = Path.GetFullPath("../../Modules"),
+                editMode = MBEditor.IsEditModeOn
+            };
+        }
+
+        private object CreateNativeModule(JObject args)
+        {
+            if (!MBEditor.IsEditModeOn) throw new InvalidOperationException("Enter the editor before creating a module.");
+            if (args.Properties().Count() != 1 || args["moduleName"] == null || args["moduleName"].Type != JTokenType.String)
+                throw new InvalidOperationException("Only a moduleName string is accepted.");
+            string name = args.Value<string>("moduleName");
+            if (!Regex.IsMatch(name ?? "", "^[A-Za-z][A-Za-z0-9_]{0,63}$") ||
+                Regex.IsMatch(name, "^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$", RegexOptions.IgnoreCase))
+                throw new InvalidOperationException("Invalid module folder name.");
+            string modulesRoot = Path.GetFullPath("../../Modules");
+            string destination = Path.GetFullPath(Path.Combine(modulesRoot, name));
+            if (!string.Equals(Path.GetDirectoryName(destination), modulesRoot, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Module path escaped Modules.");
+            if (Directory.Exists(destination) || File.Exists(destination))
+                throw new InvalidOperationException("The module already exists; refusing to overwrite it.");
+            string command = "editor.create_new_module " + name;
+            string output = Utilities.ExecuteCommandLineCommand(command);
+            string manifest = Path.Combine(destination, "SubModule.xml");
+            if (!File.Exists(manifest) || !Directory.Exists(Path.Combine(destination, "ModuleData")))
+                throw new InvalidOperationException("Native creation did not produce a complete module. Inspect the target before retrying.");
+            return new { created = true, moduleName = name, nativePath = destination,
+                command, output, capability = "native_module_create_v1" };
+        }
+
         private object Status()
         {
             bool editMode = MBEditor.IsEditModeOn;
             Scene scene = editMode ? MBEditor._editorScene : null;
             return new {
-                editorEnabled = Utilities.EditModeEnabled, editMode,
+                editorEnabled = Utilities.EditModeEnabled, editMode, canEnterEditor = TaleWorlds.ScreenSystem.ScreenManager.TopScreen is MBInitialScreenBase,
                 scene = scene == null ? null : scene.GetName(),
                 sceneModule = scene == null ? null : scene.GetModulePath(),
                 cameraPosition = scene == null ? null : new [] {scene.LastFinalRenderCameraPosition.x,scene.LastFinalRenderCameraPosition.y,scene.LastFinalRenderCameraPosition.z},
@@ -338,7 +561,9 @@ namespace BannerlordSage.EditorProbe
                 resolvedProbeScene = ResolveProbeScene(),
                 editorAssembly = typeof(MBEditor).Assembly.Location,
                 sceneApi = typeof(Scene).Assembly.Location,
-                ticks = _ticks, probeScene = ProbeSceneName
+                waterLevel = scene == null ? (float?)null : scene.GetWaterLevel(),
+                floraInstanceCount = scene == null ? (int?)null : scene.GetFloraInstanceCount(),
+                ticks = _ticks, probeScene = ProbeSceneName, bridgeCapabilities = new [] { "native_module_create_v1", "scene_binding_v1", "native_terrain_generate_v1", "native_scene_lifecycle_v1", "native_heightmap_import_v1", "live_terrain_flora_v1" }
             };
         }
 
@@ -460,7 +685,7 @@ namespace BannerlordSage.EditorProbe
             float x=row.Value<float?>("x")??0, y=row.Value<float?>("y")??0, z=row.Value<float?>("z")??0;
             float rx=row.Value<float?>("rx")??0, ry=row.Value<float?>("ry")??0, rz=row.Value<float?>("rz")??0;
             float sx=row.Value<float?>("sx")??1, sy=row.Value<float?>("sy")??1, sz=row.Value<float?>("sz")??1;
-            if (!new [] {x,y,z,rx,ry,rz,sx,sy,sz}.All(Finite) || Math.Abs(x)>100 || Math.Abs(y)>100 || Math.Abs(z)>100 ||
+            if (!new [] {x,y,z,rx,ry,rz,sx,sy,sz}.All(Finite) || Math.Abs(x)>200 || Math.Abs(y)>200 || Math.Abs(z)>100 ||
                 Math.Abs(rx)>3600 || Math.Abs(ry)>3600 || Math.Abs(rz)>3600 || sx<0.05f || sy<0.05f || sz<0.05f || sx>20 || sy>20 || sz>20)
                 throw new InvalidOperationException("Layout transform outside bounds.");
             Mat3 rotation = Mat3.Identity;
